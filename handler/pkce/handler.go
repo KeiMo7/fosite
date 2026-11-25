@@ -5,9 +5,6 @@ package pkce
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"regexp"
 
 	"github.com/ory/x/errorsx"
 
@@ -30,8 +27,6 @@ type Handler struct {
 }
 
 var _ fosite.TokenEndpointHandler = (*Handler)(nil)
-
-var verifierWrongFormat = regexp.MustCompile("[^\\w\\.\\-~]")
 
 func (c *Handler) HandleAuthorizeEndpointRequest(ctx context.Context, ar fosite.AuthorizeRequester, resp fosite.AuthorizeResponder) error {
 	// This let's us define multiple response types, for example open id connect's id_token
@@ -134,10 +129,8 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 	signature := c.AuthorizeCodeStrategy.AuthorizeCodeSignature(ctx, code)
 	pkceRequest, err := c.Storage.GetPKCERequestSession(ctx, signature, request.GetSession())
 
-	nv := len(verifier)
-
 	if errors.Is(err, fosite.ErrNotFound) {
-		if nv == 0 {
+		if len(verifier) == 0 {
 			return c.validateNoPKCE(ctx, request.GetClient())
 		}
 
@@ -146,21 +139,19 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
 
-	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
-		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
-	}
-
 	challenge := pkceRequest.GetRequestForm().Get("code_challenge")
 	method := pkceRequest.GetRequestForm().Get("code_challenge_method")
 	client := pkceRequest.GetClient()
+
+	// The challenge method policy is evaluated before the verifier so that
+	// disabled or unsupported methods are reported consistently.
 	if err := c.validate(ctx, challenge, method, client); err != nil {
 		return err
 	}
 
-	nc := len(challenge)
-
-	if !c.Config.GetEnforcePKCE(ctx) && nc == 0 && nv == 0 {
-		return nil
+	// If PKCE is neither enforced nor used, there is nothing left to validate.
+	if !c.Config.GetEnforcePKCE(ctx) && len(challenge) == 0 && len(verifier) == 0 {
+		return c.deletePKCERequestSession(ctx, signature)
 	}
 
 	// NOTE: The code verifier SHOULD have enough entropy to make it
@@ -169,19 +160,36 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 	// 	sequence.  The octet sequence is then base64url-encoded to produce a
 	// 	43-octet URL safe string to use as the code verifier.
 
-	// Validation
-	if nv < 43 {
+	// Validation. The verifier length is checked first, then its character
+	// set, then the challenge structure, and only then the values are
+	// compared. Every step returns at most one error.
+	if len(verifier) < MinCodeVerifierLength {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.
 			WithHint("The PKCE code verifier must be at least 43 characters."))
-	} else if nv > 128 {
+	} else if len(verifier) > MaxCodeVerifierLength {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.
 			WithHint("The PKCE code verifier can not be longer than 128 characters."))
-	} else if verifierWrongFormat.MatchString(verifier) {
+	} else if !isCodeVerifierString(verifier) {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.
 			WithHint("The PKCE code verifier must only contain [a-Z], [0-9], '-', '.', '_', '~'."))
-	} else if nc == 0 {
+	} else if len(challenge) == 0 {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.
 			WithHint("The PKCE code verifier was provided but the code challenge was absent from the authorization request."))
+	}
+
+	parsedMethod, err := ParseChallengeMethod(method)
+	if err != nil {
+		return errorsx.WithStack(fosite.ErrInvalidGrant.WithWrap(err).WithDebug("The stored PKCE code challenge method is not supported."))
+	}
+
+	codeChallenge, err := ParseCodeChallenge(parsedMethod, challenge)
+	if err != nil {
+		// A challenge that can not be parsed is indistinguishable from a
+		// mismatch from the client's point of view. The wrapped sentinel
+		// carries the static diagnostic, never the challenge itself.
+		return errorsx.WithStack(fosite.ErrInvalidGrant.
+			WithWrap(err).
+			WithHint("The PKCE code challenge did not match the code verifier."))
 	}
 
 	// Upon receipt of the request at the token endpoint, the server
@@ -205,27 +213,22 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 	// as normal (as defined by OAuth 2.0 [RFC6749]).  If the values are not
 	// equal, an error response indicating "invalid_grant" as described in
 	// Section 5.2 of [RFC6749] MUST be returned.
-	switch method {
-	case "S256":
-		hash := sha256.New()
-		if _, err := hash.Write([]byte(verifier)); err != nil {
-			return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
-		}
-
-		if base64.RawURLEncoding.EncodeToString(hash.Sum([]byte{})) != challenge {
-			return errorsx.WithStack(fosite.ErrInvalidGrant.
-				WithHint("The PKCE code challenge did not match the code verifier."))
-		}
-		break
-	case "plain":
-		fallthrough
-	default:
-		if verifier != challenge {
-			return errorsx.WithStack(fosite.ErrInvalidGrant.
-				WithHint("The PKCE code challenge did not match the code verifier."))
-		}
+	if err := codeChallenge.Verify(verifier); err != nil {
+		return errorsx.WithStack(fosite.ErrInvalidGrant.
+			WithWrap(err).
+			WithHint("The PKCE code challenge did not match the code verifier."))
 	}
 
+	// The PKCE session is single-use and is only consumed once the request
+	// has been fully validated. A failed verification therefore remains
+	// retryable with the correct verifier.
+	return c.deletePKCERequestSession(ctx, signature)
+}
+
+func (c *Handler) deletePKCERequestSession(ctx context.Context, signature string) error {
+	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
+		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
+	}
 	return nil
 }
 

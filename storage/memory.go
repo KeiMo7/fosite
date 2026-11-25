@@ -60,6 +60,14 @@ type MemoryStore struct {
 	IssuerPublicKeys map[string]IssuerPublicKeys
 	PARSessions      map[string]fosite.AuthorizeRequester
 
+	// Token family indexes. They map a request ID to every token signature
+	// that was ever issued for it, so that revoking a request ID revokes the
+	// whole token family instead of only the latest signature. The indexes are
+	// guarded by accessTokenRequestIDsMutex and refreshTokenRequestIDsMutex
+	// respectively, always acquired before the token tables.
+	accessTokenFamilies  map[string]map[string]struct{}
+	refreshTokenFamilies map[string]map[string]struct{}
+
 	clientsMutex                sync.RWMutex
 	authorizeCodesMutex         sync.RWMutex
 	idSessionsMutex             sync.RWMutex
@@ -317,8 +325,19 @@ func (s *MemoryStore) CreateAccessTokenSession(_ context.Context, signature stri
 	s.accessTokensMutex.Lock()
 	defer s.accessTokensMutex.Unlock()
 
+	if s.AccessTokenRequestIDs == nil {
+		s.AccessTokenRequestIDs = make(map[string]string)
+	}
+	if s.AccessTokens == nil {
+		s.AccessTokens = make(map[string]fosite.Requester)
+	}
+	if s.accessTokenFamilies == nil {
+		s.accessTokenFamilies = make(map[string]map[string]struct{})
+	}
+
 	s.AccessTokens[signature] = req
 	s.AccessTokenRequestIDs[req.GetID()] = signature
+	s.addAccessTokenToFamily(req.GetID(), signature)
 	return nil
 }
 
@@ -334,11 +353,41 @@ func (s *MemoryStore) GetAccessTokenSession(_ context.Context, signature string,
 }
 
 func (s *MemoryStore) DeleteAccessTokenSession(_ context.Context, signature string) error {
+	// The family index is locked first to match the lock ordering used by
+	// CreateAccessTokenSession and RevokeAccessToken.
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
 	s.accessTokensMutex.Lock()
 	defer s.accessTokensMutex.Unlock()
 
-	delete(s.AccessTokens, signature)
+	s.deleteAccessTokenSessionLocked(signature)
 	return nil
+}
+
+// deleteAccessTokenSessionLocked removes an access token and its family index
+// entry. The caller must hold accessTokenRequestIDsMutex and accessTokensMutex.
+func (s *MemoryStore) deleteAccessTokenSessionLocked(signature string) {
+	delete(s.AccessTokens, signature)
+	for requestID, signatures := range s.accessTokenFamilies {
+		if _, ok := signatures[signature]; !ok {
+			continue
+		}
+		delete(signatures, signature)
+		if len(signatures) == 0 {
+			delete(s.accessTokenFamilies, requestID)
+		}
+	}
+}
+
+// addAccessTokenToFamily registers a signature in the token family of requestID.
+// The caller must hold accessTokenRequestIDsMutex.
+func (s *MemoryStore) addAccessTokenToFamily(requestID, signature string) {
+	signatures, ok := s.accessTokenFamilies[requestID]
+	if !ok {
+		signatures = make(map[string]struct{})
+		s.accessTokenFamilies[requestID] = signatures
+	}
+	signatures[signature] = struct{}{}
 }
 
 func (s *MemoryStore) CreateRefreshTokenSession(_ context.Context, signature, accessTokenSignature string, req fosite.Requester) error {
@@ -349,8 +398,19 @@ func (s *MemoryStore) CreateRefreshTokenSession(_ context.Context, signature, ac
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
+	if s.RefreshTokenRequestIDs == nil {
+		s.RefreshTokenRequestIDs = make(map[string]string)
+	}
+	if s.RefreshTokens == nil {
+		s.RefreshTokens = make(map[string]StoreRefreshToken)
+	}
+	if s.refreshTokenFamilies == nil {
+		s.refreshTokenFamilies = make(map[string]map[string]struct{})
+	}
+
 	s.RefreshTokens[signature] = StoreRefreshToken{active: true, Requester: req, accessTokenSignature: accessTokenSignature}
 	s.RefreshTokenRequestIDs[req.GetID()] = signature
+	s.addRefreshTokenToFamily(req.GetID(), signature)
 	return nil
 }
 
@@ -369,11 +429,42 @@ func (s *MemoryStore) GetRefreshTokenSession(_ context.Context, signature string
 }
 
 func (s *MemoryStore) DeleteRefreshTokenSession(_ context.Context, signature string) error {
+	// The family index is locked first to match the lock ordering used by
+	// CreateRefreshTokenSession and RevokeRefreshToken.
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
-	delete(s.RefreshTokens, signature)
+	s.deleteRefreshTokenSessionLocked(signature)
 	return nil
+}
+
+// deleteRefreshTokenSessionLocked removes a refresh token and its family index
+// entry. The caller must hold refreshTokenRequestIDsMutex and
+// refreshTokensMutex.
+func (s *MemoryStore) deleteRefreshTokenSessionLocked(signature string) {
+	delete(s.RefreshTokens, signature)
+	for requestID, signatures := range s.refreshTokenFamilies {
+		if _, ok := signatures[signature]; !ok {
+			continue
+		}
+		delete(signatures, signature)
+		if len(signatures) == 0 {
+			delete(s.refreshTokenFamilies, requestID)
+		}
+	}
+}
+
+// addRefreshTokenToFamily registers a signature in the token family of
+// requestID. The caller must hold refreshTokenRequestIDsMutex.
+func (s *MemoryStore) addRefreshTokenToFamily(requestID, signature string) {
+	signatures, ok := s.refreshTokenFamilies[requestID]
+	if !ok {
+		signatures = make(map[string]struct{})
+		s.refreshTokenFamilies[requestID] = signatures
+	}
+	signatures[signature] = struct{}{}
 }
 
 func (s *MemoryStore) Authenticate(_ context.Context, name string, secret string) (subject string, err error) {
@@ -398,10 +489,20 @@ func (s *MemoryStore) RevokeRefreshToken(ctx context.Context, requestID string) 
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
-	if signature, exists := s.RefreshTokenRequestIDs[requestID]; exists {
+	// Revoke every refresh token that was ever issued for this request ID, not
+	// only the most recent one. Unknown request IDs are a no-op.
+	signatures := make(map[string]struct{}, len(s.refreshTokenFamilies[requestID])+1)
+	for signature := range s.refreshTokenFamilies[requestID] {
+		signatures[signature] = struct{}{}
+	}
+	if signature, ok := s.RefreshTokenRequestIDs[requestID]; ok {
+		signatures[signature] = struct{}{}
+	}
+
+	for signature := range signatures {
 		rel, ok := s.RefreshTokens[signature]
 		if !ok {
-			return fosite.ErrNotFound
+			continue
 		}
 		rel.active = false
 		s.RefreshTokens[signature] = rel
@@ -410,14 +511,22 @@ func (s *MemoryStore) RevokeRefreshToken(ctx context.Context, requestID string) 
 }
 
 func (s *MemoryStore) RevokeAccessToken(ctx context.Context, requestID string) error {
-	s.accessTokenRequestIDsMutex.RLock()
-	defer s.accessTokenRequestIDsMutex.RUnlock()
+	// Lock order: request ID index first, token table second. This matches
+	// CreateAccessTokenSession and DeleteAccessTokenSession.
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
+	s.accessTokensMutex.Lock()
+	defer s.accessTokensMutex.Unlock()
 
-	if signature, exists := s.AccessTokenRequestIDs[requestID]; exists {
-		if err := s.DeleteAccessTokenSession(ctx, signature); err != nil {
-			return err
-		}
+	// Revoke every access token that was ever issued for this request ID, not
+	// only the most recent one. Unknown request IDs are a no-op.
+	for signature := range s.accessTokenFamilies[requestID] {
+		delete(s.AccessTokens, signature)
 	}
+	if signature, ok := s.AccessTokenRequestIDs[requestID]; ok {
+		delete(s.AccessTokens, signature)
+	}
+	delete(s.accessTokenFamilies, requestID)
 	return nil
 }
 
@@ -518,13 +627,57 @@ func (s *MemoryStore) DeletePARSession(ctx context.Context, requestURI string) (
 	return nil
 }
 
+// RotateRefreshToken consumes the presented refresh token exactly once. It
+// marks the token inactive and removes the access token that was issued
+// alongside it, so that a refresh token can only be exchanged a single time.
+//
+// The refresh token must exist, belong to requestID, still be active and still
+// be the current token of that request. When another request has already
+// consumed it, ErrSerializationFailure is returned so the caller can ask the
+// client to retry.
 func (s *MemoryStore) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
-	// Graceful token rotation can be implemented here but it's beyond the scope of this example. Check
-	// the Ory Hydra implementation for reference.
-	if err := s.RevokeRefreshToken(ctx, requestID); err != nil {
-		return err
+	// Lock order: refresh request ID index, refresh token table, and only then
+	// the access token table. No code path acquires these locks in reverse
+	// order.
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
+	s.refreshTokensMutex.Lock()
+	defer s.refreshTokensMutex.Unlock()
+
+	if len(refreshTokenSignature) == 0 {
+		return fosite.ErrNotFound
 	}
-	return s.RevokeAccessToken(ctx, requestID)
+
+	rel, ok := s.RefreshTokens[refreshTokenSignature]
+	if !ok {
+		return fosite.ErrNotFound
+	}
+	if !rel.active {
+		return fosite.ErrSerializationFailure
+	}
+	if rel.Requester == nil || rel.GetID() != requestID {
+		return fosite.ErrNotFound
+	}
+	if current, ok := s.RefreshTokenRequestIDs[requestID]; !ok || current != refreshTokenSignature {
+		return fosite.ErrSerializationFailure
+	}
+
+	rel.active = false
+	s.RefreshTokens[refreshTokenSignature] = rel
+
+	if len(rel.accessTokenSignature) > 0 {
+		s.accessTokensMutex.Lock()
+		defer s.accessTokensMutex.Unlock()
+
+		// Only the presented refresh token and the access token it was paired
+		// with are consumed. The family index is intentionally left alone:
+		// the signature is unique, and removing stale entries from the index
+		// would require taking the request ID mutex out of the established
+		// lock order.
+		delete(s.AccessTokens, rel.accessTokenSignature)
+	}
+
+	return nil
 }
 
 // CreateDeviceAuthSession stores the device auth session
